@@ -1,9 +1,9 @@
 """GR00T modality config for Star AI Robot Arm (single arm).
 
-Star AI so_follower:
-  - 5 arm joints + 1 gripper = 6 DOF
-  - Joint names: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper
-  - Cameras: side, rear
+Star AI single arm:
+  - 6 arm motors + 1 gripper = 7 control channels
+  - Joint names in the recorded dataset: Motor_0 .. Motor_5, gripper
+  - Cameras consumed by this config: side, rear, onhand
 
 Usage:
   python gr00t/experiment/launch_finetune.py \
@@ -28,7 +28,7 @@ from gr00t.data.types import (
 starai_single_arm_config = {
     "video": ModalityConfig(
         delta_indices=[0],
-        modality_keys=["side", "rear"],
+        modality_keys=["side", "rear", "onhand"],
     ),
     "state": ModalityConfig(
         delta_indices=[0],
@@ -44,7 +44,7 @@ starai_single_arm_config = {
             "gripper",
         ],
         action_configs=[
-            # single_arm (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll)
+            # single_arm (Motor_0 .. Motor_5)
             ActionConfig(
                 rep=ActionRepresentation.RELATIVE,
                 type=ActionType.NON_EEF,
