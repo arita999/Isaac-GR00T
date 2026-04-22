@@ -257,6 +257,9 @@ def eval(cfg: EvalConfig):
         obs = robot.get_observation()
         obs["lang"] = cfg.lang_instruction
 
+        state_dbg = {k: obs[k] for k in policy.robot_state_keys}
+        print(f"state: {state_dbg}")
+
         actions = policy.get_action(obs)
 
         for i, action_dict in enumerate(actions[: cfg.action_horizon]):
