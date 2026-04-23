@@ -46,7 +46,7 @@ starai_single_arm_config = {
         action_configs=[
             # single_arm (Motor_0 .. Motor_5)
             ActionConfig(
-                rep=ActionRepresentation.RELATIVE,
+                rep=ActionRepresentation.ABSOLUTE,
                 type=ActionType.NON_EEF,
                 format=ActionFormat.DEFAULT,
             ),
