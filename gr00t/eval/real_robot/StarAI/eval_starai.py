@@ -49,16 +49,15 @@ from lerobot_robot_cello.starai_cello import StaraiCello
 # chocolat-nya/20260408_star_3cameras_groot_v2. Used to override the
 # hard-coded StaraiCello.move_to_initial_position() home pose so that
 # evaluation starts inside the training distribution.
-# Motor_5 t=0 is bimodal ([-5,+5] and [20,25]); we pick the denser mode
-# center (~0.0) instead of the overall median (11.18) which falls in
-# the valley between the two modes.
+# Values are per-motor medians over all 62 episode-start frames
+# (see src/verify_initial_pose.py).
 TRAINING_INITIAL_POSE: Dict[str, float] = {
     "Motor_0": 0.03,
     "Motor_1": -100.0,
     "Motor_2": 97.79,
     "Motor_3": -0.44,
     "Motor_4": 1.02,
-    "Motor_5": 0.0,
+    "Motor_5": 11.18,
     "gripper": 96.19,
 }
 
