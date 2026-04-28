@@ -45,20 +45,29 @@ import lerobot_robot_cello  # noqa: F401
 from lerobot_robot_cello.starai_cello import StaraiCello
 
 
-# Training-data episode-start pose from
-# chocolat-nya/20260408_star_3cameras_groot_v2. Used to override the
-# hard-coded StaraiCello.move_to_initial_position() home pose so that
-# evaluation starts inside the training distribution.
-# Values are per-motor medians over all 62 episode-start frames
-# (see src/verify_initial_pose.py).
+# Training-data episode-start pose from the 20260427_data dataset
+# (/media/kazu/data/GR00T/20260427_data, 180 episodes) which was used to
+# train run_20260428_0415. Used to override the hard-coded
+# StaraiCello.move_to_initial_position() home pose so that evaluation
+# starts inside the training distribution.
+#
+# Values are per-motor recommendations from src/verify_initial_pose.py:
+#   - Motor_0: bimodal (-0.39 and -2.41); use denser peak
+#   - Motor_1: near-unimodal, median
+#   - Motor_2: bimodal (72.0 and 98.5); use denser peak
+#   - Motor_3: median (3.14)
+#   - Motor_4: bimodal (16.3 and -6.1); use denser peak
+#   - Motor_5: effectively constant in training (-1.48 or -0.75);
+#              the hardware mechanically settles here regardless of command
+#   - gripper: bimodal (0.86 and 49.9); use denser peak (almost closed)
 TRAINING_INITIAL_POSE: Dict[str, float] = {
-    "Motor_0": 0.03,
+    "Motor_0": -0.39,
     "Motor_1": -100.0,
-    "Motor_2": 97.79,
-    "Motor_3": -0.44,
-    "Motor_4": 1.02,
-    "Motor_5": 11.18,
-    "gripper": 96.19,
+    "Motor_2": 72.01,
+    "Motor_3": 3.14,
+    "Motor_4": 16.31,
+    "Motor_5": -1.48,
+    "gripper": 0.86,
 }
 
 
