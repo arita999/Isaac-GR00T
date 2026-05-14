@@ -6,6 +6,7 @@ This module provides the core policy classes for running Gr00t models:
 """
 
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -43,6 +44,40 @@ def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
         return x
 
 
+def _module_device(module: torch.nn.Module) -> torch.device | None:
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return None
+
+
+def _sync_cuda_device(device: torch.device | None) -> None:
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def resolve_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+
+    normalized = dtype.lower().replace("-", "_")
+    aliases = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unsupported compute_dtype={dtype!r}. "
+            "Use one of: bfloat16, float16, float32."
+        )
+    return aliases[normalized]
+
+
 class Gr00tPolicy(BasePolicy):
     """Core policy class for Gr00t model inference.
 
@@ -63,6 +98,8 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        compute_dtype: str | torch.dtype = "bfloat16",
+        profile_model_detail: bool = True,
     ):
         """Initialize the Gr00t Policy.
 
@@ -71,17 +108,21 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            compute_dtype: Floating point dtype used for model weights and floating inputs.
+            profile_model_detail: Whether to split model inference profile into sub-stages.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
 
         super().__init__(strict=strict)
         model_dir = Path(model_path)
+        self.compute_dtype = resolve_torch_dtype(compute_dtype)
+        self.profile_model_detail = profile_model_detail
 
-        # Load the pretrained model and move to target device with bfloat16 precision
+        # Load the pretrained model and move to the requested inference precision.
         model = AutoModel.from_pretrained(model_dir, low_cpu_mem_usage=True)
         model.eval()  # Set model to evaluation mode
-        model.to(device=device, dtype=torch.bfloat16)
+        model.to(device=device, dtype=self.compute_dtype)
         self.model = model
 
         # Load the processor for input/output transformation
@@ -100,6 +141,73 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) == 1, "Only one language key is supported"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+
+    def _get_model_action_with_profile(
+        self, collated_inputs: dict[str, Any], options: dict[str, Any] | None
+    ) -> tuple[Any, dict[str, Any]]:
+        """Run model inference, using a detailed path when the loaded model supports it."""
+        model_device = _module_device(self.model)
+        profile: dict[str, Any] = {
+            "policy_model_detail_profile_enabled": self.profile_model_detail,
+            "policy_model_detail_profile_supported": False,
+        }
+
+        supports_detail = (
+            self.profile_model_detail
+            and "inputs" in collated_inputs
+            and hasattr(self.model, "prepare_input")
+            and hasattr(self.model, "backbone")
+            and hasattr(self.model, "action_head")
+        )
+        if not supports_detail:
+            tic = time.perf_counter()
+            with torch.inference_mode():
+                model_pred = self.model.get_action(**collated_inputs)
+            _sync_cuda_device(model_device)
+            profile["policy_model_forward_sec"] = time.perf_counter() - tic
+            return model_pred, profile
+
+        profile["policy_model_detail_profile_supported"] = True
+        total_tic = time.perf_counter()
+
+        tic = time.perf_counter()
+        with torch.inference_mode():
+            backbone_inputs, action_inputs = self.model.prepare_input(collated_inputs["inputs"])
+        _sync_cuda_device(model_device)
+        profile["policy_model_prepare_input_sec"] = time.perf_counter() - tic
+
+        tic = time.perf_counter()
+        with torch.inference_mode():
+            backbone_outputs = self.model.backbone(backbone_inputs)
+        _sync_cuda_device(model_device)
+        profile["policy_model_backbone_sec"] = time.perf_counter() - tic
+
+        tic = time.perf_counter()
+        with torch.inference_mode():
+            if hasattr(self.model.action_head, "get_action_profiled"):
+                model_pred, action_head_profile = self.model.action_head.get_action_profiled(
+                    backbone_outputs,
+                    action_inputs,
+                    options=options,
+                )
+            else:
+                try:
+                    model_pred = self.model.action_head.get_action(
+                        backbone_outputs,
+                        action_inputs,
+                        options,
+                    )
+                except TypeError:
+                    model_pred = self.model.action_head.get_action(
+                        backbone_outputs,
+                        action_inputs,
+                    )
+                action_head_profile = {}
+        _sync_cuda_device(model_device)
+        profile["policy_model_action_head_sec"] = time.perf_counter() - tic
+        profile.update(action_head_profile)
+        profile["policy_model_forward_sec"] = time.perf_counter() - total_tic
+        return model_pred, profile
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -322,40 +430,70 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Tuple of (actions_dict, info_dict)
         """
+        profile_tic = time.perf_counter()
+        profile: dict[str, Any] = {}
+
         # Step 1: Split batched observation into individual observations
+        tic = time.perf_counter()
         unbatched_observations = self._unbatch_observation(observation)
         processed_inputs = []
+        profile["policy_unbatch_observation_sec"] = time.perf_counter() - tic
 
         # Step 2: Process each observation through the VLA processor
+        tic = time.perf_counter()
         states = []
         for obs in unbatched_observations:
             vla_step_data = self._to_vla_step_data(obs)
             states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
+        profile["policy_processor_sec"] = time.perf_counter() - tic
 
         # Step 3: Collate processed inputs into a single batch for model
+        tic = time.perf_counter()
         collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        profile["policy_collate_sec"] = time.perf_counter() - tic
+
+        tic = time.perf_counter()
+        collated_inputs = _rec_to_dtype(collated_inputs, dtype=self.compute_dtype)
+        profile["policy_dtype_cast_sec"] = time.perf_counter() - tic
+        profile["policy_compute_dtype"] = str(self.compute_dtype).removeprefix("torch.")
 
         # Step 4: Run model inference to predict actions
-        with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+        model_pred, model_profile = self._get_model_action_with_profile(collated_inputs, options)
+        profile.update(model_profile)
+
+        model_device = _module_device(self.model)
+        tic = time.perf_counter()
         normalized_action = model_pred["action_pred"].float()
+        _sync_cuda_device(model_device)
+        profile["policy_action_float_cast_sec"] = time.perf_counter() - tic
 
         # Step 5: Decode actions from normalized space back to physical units
+        tic = time.perf_counter()
         batched_states = {}
         for k in self.modality_configs["state"].modality_keys:
             batched_states[k] = np.stack([s[k] for s in states], axis=0)  # (B, T, D)
+        profile["policy_state_stack_sec"] = time.perf_counter() - tic
+
+        tic = time.perf_counter()
+        normalized_action_np = normalized_action.cpu().numpy()
+        profile["policy_action_to_cpu_numpy_sec"] = time.perf_counter() - tic
+
+        tic = time.perf_counter()
         unnormalized_action = self.processor.decode_action(
-            normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
+            normalized_action_np, self.embodiment_tag, batched_states
         )
+        profile["policy_decode_action_sec"] = time.perf_counter() - tic
 
         # Cast all actions to float32 for consistency
+        tic = time.perf_counter()
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        profile["policy_output_cast_sec"] = time.perf_counter() - tic
+        profile["policy_total_sec"] = time.perf_counter() - profile_tic
+        return casted_action, {"model_profile": profile}
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

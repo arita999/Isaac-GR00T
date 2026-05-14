@@ -26,6 +26,12 @@ class ServerConfig:
     device: str = "cuda"
     """Device to run the model on"""
 
+    compute_dtype: str = "bfloat16"
+    """Floating point dtype for GR00T model inference: bfloat16, float16, or float32."""
+
+    profile_model_detail: bool = True
+    """Log detailed model inference breakdown. Disable with --no-profile-model-detail."""
+
     # Replay policy configs
     dataset_path: str | None = None
     """Path to the dataset for replay trajectory"""
@@ -55,6 +61,8 @@ def main(config: ServerConfig):
     print(f"  Embodiment tag: {config.embodiment_tag}")
     print(f"  Model path: {config.model_path}")
     print(f"  Device: {config.device}")
+    print(f"  Compute dtype: {config.compute_dtype}")
+    print(f"  Profile model detail: {config.profile_model_detail}")
     print(f"  Host: {config.host}")
     print(f"  Port: {config.port}")
 
@@ -69,6 +77,8 @@ def main(config: ServerConfig):
             model_path=config.model_path,
             device=config.device,
             strict=config.strict,
+            compute_dtype=config.compute_dtype,
+            profile_model_detail=config.profile_model_detail,
         )
     elif config.dataset_path is not None:
         if config.modality_config_path is None:

@@ -73,12 +73,12 @@ DEFAULT_TRAINING_DATASET_CANDIDATES = [
 ]
 
 MAX_ACTION_STEP: Dict[str, float] = {
-    "Motor_0.pos": 2.0,
-    "Motor_1.pos": 5.0,
-    "Motor_2.pos": 4.0,
-    "Motor_3.pos": 2.0,
-    "Motor_4.pos": 4.0,
-    "Motor_5.pos": 0.15,
+    "Motor_0.pos": 4.0,
+    "Motor_1.pos": 15.0,
+    "Motor_2.pos": 12.0,
+    "Motor_3.pos": 3.0,
+    "Motor_4.pos": 6.0,
+    "Motor_5.pos": 0.3,
     "gripper.pos": 10.0,
 }
 
@@ -269,6 +269,15 @@ class TrainingActionGuide:
         }
 
 
+def effective_training_action_guide_until_sec(
+    guide: TrainingActionGuide | None,
+    until_sec: float,
+) -> float:
+    if guide is None:
+        return float(until_sec)
+    return min(float(until_sec), float(guide.timestamps[-1]))
+
+
 def _find_first_episode_parquet(dataset_path: str) -> str:
     root = os.path.expanduser(dataset_path)
     data_root = os.path.join(root, "data")
@@ -335,7 +344,9 @@ def apply_training_action_guide(
     setup_sec: float,
 ) -> Dict[str, float]:
     mode = normalize_training_action_guide(mode)
-    if guide is None or mode == "off" or elapsed_sec > until_sec:
+    if guide is None or mode == "off":
+        return action
+    if elapsed_sec > effective_training_action_guide_until_sec(guide, until_sec):
         return action
 
     source_action = guide.action_at(elapsed_sec)
@@ -525,13 +536,22 @@ def send_robot_action(
     return {f"{motor}.pos": val for motor, val in goal_pos.items()}
 
 
-def wait_for_motion_completion(send_started_at: float, motion_time_ms: int) -> float:
-    """Wait until a timed StarAI motion should have finished."""
+def wait_after_motion_command(send_started_at: float, motion_time_ms: int) -> float:
+    """Wait partway into a timed motion before reading state again."""
+    return wait_after_motion_command_with_fraction(send_started_at, motion_time_ms, 0.0)
+
+
+def wait_after_motion_command_with_fraction(
+    send_started_at: float,
+    motion_time_ms: int,
+    wait_fraction: float,
+) -> float:
+    """Wait a configurable fraction of a timed motion before reading state again."""
     if motion_time_ms <= 0:
         return 0.0
 
-    motion_time_sec = float(motion_time_ms) / 1000.0
-    remaining_sec = motion_time_sec - (time.monotonic() - send_started_at)
+    wait_sec = (float(motion_time_ms) / 1000.0) * float(wait_fraction)
+    remaining_sec = wait_sec - (time.monotonic() - send_started_at)
     if remaining_sec > 0:
         time.sleep(remaining_sec)
     return max(0.0, remaining_sec)
@@ -671,6 +691,8 @@ def validate_control_config(cfg: "EvalConfig") -> None:
         raise ValueError("training_action_guide_setup_sec must be >= 0.")
     if cfg.keep_gripper_open_until_sec < 0:
         raise ValueError("keep_gripper_open_until_sec must be >= 0.")
+    if cfg.motion_post_send_wait_fraction < 0 or cfg.motion_post_send_wait_fraction > 1:
+        raise ValueError("motion_post_send_wait_fraction must be between 0 and 1.")
     if 0 < cfg.motion_time_ms < MIN_ARM_MOTION_TIME_MS:
         raise ValueError(
             f"motion_time_ms must be 0 or >= {MIN_ARM_MOTION_TIME_MS}. "
@@ -769,6 +791,7 @@ class StarAIAdapter:
         ]
         self.camera_keys = camera_keys
         self.language_key = language_key
+        self.last_policy_info: Dict[str, Any] = {}
 
     def obs_to_policy_inputs(self, obs: Dict[str, Any], batch_size: int = 1) -> Dict:
         model_obs: Dict[str, Any] = {}
@@ -809,22 +832,48 @@ class StarAIAdapter:
         num_samples: int = 1,
         aggregation: str = "median",
     ) -> List[Dict[str, float]]:
+        adapter_tic = time.perf_counter()
         num_samples = max(1, int(num_samples))
-        chunks = self._get_batched_action_chunks(obs, num_samples)
-        return aggregate_action_chunks(chunks, self.robot_state_keys, aggregation)
+        chunks, info, adapter_profile = self._get_batched_action_chunks(obs, num_samples)
 
-    def _get_batched_action_chunks(self, obs: Dict, batch_size: int) -> List[List[Dict[str, float]]]:
+        tic = time.perf_counter()
+        actions = aggregate_action_chunks(chunks, self.robot_state_keys, aggregation)
+        adapter_profile["adapter_aggregate_action_chunks_sec"] = time.perf_counter() - tic
+        adapter_profile["adapter_total_sec"] = time.perf_counter() - adapter_tic
+
+        self.last_policy_info = dict(info) if isinstance(info, dict) else {"raw_info": info}
+        self.last_policy_info["adapter_profile"] = adapter_profile
+        return actions
+
+    def _get_batched_action_chunks(
+        self,
+        obs: Dict,
+        batch_size: int,
+    ) -> Tuple[List[List[Dict[str, float]]], Dict[str, Any], Dict[str, float]]:
+        adapter_profile: Dict[str, float] = {}
+
+        tic = time.perf_counter()
         model_input = self.obs_to_policy_inputs(obs, batch_size=batch_size)
+        adapter_profile["adapter_obs_to_policy_inputs_sec"] = time.perf_counter() - tic
+
+        tic = time.perf_counter()
         action_chunk, info = self.policy.get_action(model_input)
+        adapter_profile["adapter_policy_client_get_action_sec"] = time.perf_counter() - tic
 
         any_key = next(iter(action_chunk.keys()))
         horizon = action_chunk[any_key].shape[1]  # (B, T, D) → T
         actual_batch_size = action_chunk[any_key].shape[0]
 
-        return [
+        tic = time.perf_counter()
+        chunks = [
             [self.decode_action_chunk(action_chunk, t, batch_index=b) for t in range(horizon)]
             for b in range(actual_batch_size)
         ]
+        adapter_profile["adapter_decode_action_chunk_sec"] = time.perf_counter() - tic
+        adapter_profile["adapter_action_horizon"] = float(horizon)
+        adapter_profile["adapter_action_batch_size"] = float(actual_batch_size)
+        adapter_profile["adapter_requested_batch_size"] = float(batch_size)
+        return chunks, info, adapter_profile
 
 
 # =============================================================================
@@ -848,7 +897,7 @@ class EvalConfig:
     play_sounds: bool = False
     timeout: int = 60
     control_hz: float = 30.0
-    clamp_action_step: bool = True
+    clamp_action_step: bool = False
     execute_steps: int = 4
     action_select_index: int = 0
     action_selection_strategy: str = "fixed_index"
@@ -859,13 +908,14 @@ class EvalConfig:
     temporal_ensemble: bool = False
     temporal_ensemble_decay: float = 0.4
     temporal_ensemble_window: int = 8
-    motion_time_ms: int = 0
+    motion_time_ms: int = 250
+    motion_post_send_wait_fraction: float = 0.0
     keep_gripper_open_until_motor1: float = 20.0
     gripper_open_value: float = 80.0
     keep_gripper_open_until_sec: float = 0.0
-    training_action_guide: str = "source_envelope"
-    training_action_guide_until_sec: float = 12.0
-    training_action_guide_setup_sec: float = 2.05
+    training_action_guide: str = "off"
+    training_action_guide_until_sec: float = 60.0
+    training_action_guide_setup_sec: float = 0.0
     training_dataset_path: str | None = None
     initial_pose_strategy: str = "first_episode"
 
@@ -963,12 +1013,18 @@ def eval(cfg: EvalConfig):
         "temporal_ensemble_decay": cfg.temporal_ensemble_decay,
         "temporal_ensemble_window": cfg.temporal_ensemble_window,
         "control_hz": cfg.control_hz,
+        "policy_profile_logging": True,
         "motion_time_ms": cfg.motion_time_ms,
+        "motion_post_send_wait_fraction": cfg.motion_post_send_wait_fraction,
         "keep_gripper_open_until_motor1": cfg.keep_gripper_open_until_motor1,
         "gripper_open_value": cfg.gripper_open_value,
         "keep_gripper_open_until_sec": cfg.keep_gripper_open_until_sec,
         "training_action_guide": cfg.training_action_guide,
         "training_action_guide_until_sec": cfg.training_action_guide_until_sec,
+        "training_action_guide_effective_until_sec": effective_training_action_guide_until_sec(
+            training_action_guide,
+            cfg.training_action_guide_until_sec,
+        ),
         "training_action_guide_setup_sec": cfg.training_action_guide_setup_sec,
         "training_action_guide_tolerance": DEFAULT_TRAINING_GUIDE_TOLERANCE,
         "training_action_guide_source": (
@@ -980,8 +1036,8 @@ def eval(cfg: EvalConfig):
         "initial_pose_strategy": cfg.initial_pose_strategy,
         "initial_pose": initial_pose,
         "max_action_step": MAX_ACTION_STEP,
-        "wait_for_motion_completion": cfg.motion_time_ms > 0,
-        "clamp_reference": "pre_action_state",
+        "wait_for_motion_completion": cfg.motion_post_send_wait_fraction >= 1.0,
+        "clamp_reference": "pre_action_state" if cfg.clamp_action_step else "disabled",
         "policy_modality_config": policy_modality_config,
         "robot": str(cfg.robot),
     }
@@ -1080,6 +1136,7 @@ def eval(cfg: EvalConfig):
                 aggregation=cfg.action_aggregation,
             )
             inference_sec = time.monotonic() - inference_tic
+            policy_profile = getattr(policy, "last_policy_info", {})
             control_period = 1.0 / cfg.control_hz
             if inference_sec > control_period and step % 30 == 0:
                 logging.warning(
@@ -1105,6 +1162,7 @@ def eval(cfg: EvalConfig):
                 "state_elapsed_sec": state_elapsed_sec,
                 "base_action_tick": action_tick,
                 "inference_sec": inference_sec,
+                "policy_profile": policy_profile,
                 "language": cfg.lang_instruction,
                 "language_key": runtime_language_key,
                 "state": reference_state,
@@ -1235,9 +1293,10 @@ def eval(cfg: EvalConfig):
                     performed_action,
                     policy.robot_state_keys,
                 )
-                motion_wait_sec = wait_for_motion_completion(
+                motion_wait_sec = wait_after_motion_command_with_fraction(
                     send_started_at,
                     cfg.motion_time_ms,
+                    cfg.motion_post_send_wait_fraction,
                 )
                 post_action_state = read_robot_state(robot, policy.robot_state_keys)
                 post_action_elapsed_sec = time.monotonic() - start_time

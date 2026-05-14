@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import io
+import time
 from typing import Any, Callable
 
 import msgpack
@@ -114,13 +115,34 @@ class PolicyServer:
             return True  # No token required
         return request.get("api_token") == self.api_token
 
+    @staticmethod
+    def _attach_profile_to_policy_result(
+        result: Any,
+        profile_key: str,
+        profile: dict[str, Any],
+    ) -> Any:
+        """Attach profiling metadata to a ``(action, info)`` policy result."""
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
+            info = dict(result[1])
+            info[profile_key] = profile
+            return result[0], info
+        if isinstance(result, list) and len(result) == 2 and isinstance(result[1], dict):
+            info = dict(result[1])
+            info[profile_key] = profile
+            return [result[0], info]
+        return result
+
     def run(self):
         addr = self.socket.getsockopt_string(zmq.LAST_ENDPOINT)
         print(f"Server is ready and listening on {addr}")
         while self.running:
             try:
+                recv_tic = time.perf_counter()
                 message = self.socket.recv()
+                received_at = time.perf_counter()
+                request_decode_tic = time.perf_counter()
                 request = MsgSerializer.from_bytes(message)
+                request_decode_sec = time.perf_counter() - request_decode_tic
 
                 # Validate token before processing request
                 if not self._validate_token(request):
@@ -135,12 +157,41 @@ class PolicyServer:
                     raise ValueError(f"Unknown endpoint: {endpoint}")
 
                 handler = self._endpoints[endpoint]
+                handler_tic = time.perf_counter()
                 result = (
                     handler.handler(**request.get("data", {}))
                     if handler.requires_input
                     else handler.handler()
                 )
-                self.socket.send(MsgSerializer.to_bytes(result))
+                handler_sec = time.perf_counter() - handler_tic
+
+                server_profile = {
+                    "endpoint": endpoint,
+                    "server_idle_recv_wait_sec": received_at - recv_tic,
+                    "server_request_bytes": len(message),
+                    "server_request_decode_sec": request_decode_sec,
+                    "server_handler_sec": handler_sec,
+                    "server_total_before_response_encode_sec": time.perf_counter() - received_at,
+                }
+                if endpoint == "get_action":
+                    result = self._attach_profile_to_policy_result(
+                        result,
+                        "server_profile",
+                        server_profile,
+                    )
+
+                response_encode_tic = time.perf_counter()
+                response_payload = MsgSerializer.to_bytes(result)
+                server_profile["server_response_encode_sec"] = (
+                    time.perf_counter() - response_encode_tic
+                )
+                server_profile["server_response_bytes"] = len(response_payload)
+                if endpoint == "get_action":
+                    response_payload = MsgSerializer.to_bytes(result)
+
+                send_tic = time.perf_counter()
+                self.socket.send(response_payload)
+                server_profile["server_send_sec"] = time.perf_counter() - send_tic
             except Exception as e:
                 print(f"Error in server: {e}")
                 import traceback
@@ -169,6 +220,7 @@ class PolicyClient(BasePolicy):
         self.port = port
         self.timeout_ms = timeout_ms
         self.api_token = api_token
+        self.last_call_profile: dict[str, Any] = {}
         self._init_socket()
 
     def _init_socket(self):
@@ -207,11 +259,34 @@ class PolicyClient(BasePolicy):
         if self.api_token:
             request["api_token"] = self.api_token
 
-        self.socket.send(MsgSerializer.to_bytes(request))
+        call_tic = time.perf_counter()
+        request_encode_tic = time.perf_counter()
+        request_payload = MsgSerializer.to_bytes(request)
+        request_encode_sec = time.perf_counter() - request_encode_tic
+
+        send_tic = time.perf_counter()
+        self.socket.send(request_payload)
+        send_sec = time.perf_counter() - send_tic
+
+        recv_tic = time.perf_counter()
         message = self.socket.recv()
+        recv_sec = time.perf_counter() - recv_tic
         if message == b"ERROR":
             raise RuntimeError("Server error. Make sure we are running the correct policy server.")
+
+        response_decode_tic = time.perf_counter()
         response = MsgSerializer.from_bytes(message)
+        response_decode_sec = time.perf_counter() - response_decode_tic
+        self.last_call_profile = {
+            "endpoint": endpoint,
+            "client_request_bytes": len(request_payload),
+            "client_response_bytes": len(message),
+            "client_request_encode_sec": request_encode_sec,
+            "client_send_sec": send_sec,
+            "client_recv_sec": recv_sec,
+            "client_response_decode_sec": response_decode_sec,
+            "client_roundtrip_sec": time.perf_counter() - call_tic,
+        }
 
         if isinstance(response, dict) and "error" in response:
             raise RuntimeError(f"Server error: {response['error']}")
@@ -228,7 +303,11 @@ class PolicyClient(BasePolicy):
         response = self.call_endpoint(
             "get_action", {"observation": observation, "options": options}
         )
-        return tuple(response)  # Convert list (from msgpack) to tuple of (action, info)
+        action, info = tuple(response)  # Convert list (from msgpack) to tuple of (action, info)
+        if isinstance(info, dict):
+            info = dict(info)
+            info["client_profile"] = dict(self.last_call_profile)
+        return action, info
 
     def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.call_endpoint("reset", {"options": options})
