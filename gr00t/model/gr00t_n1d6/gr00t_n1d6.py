@@ -1,4 +1,5 @@
-from typing import Tuple
+import time
+from typing import Any, Tuple
 
 from gr00t.configs.model.gr00t_n1d6 import Gr00tN1d6Config
 from gr00t.model.modules.dit import AlternateVLDiT, DiT
@@ -14,6 +15,30 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 from transformers.feature_extraction_utils import BatchFeature
 import tree
+
+
+def _sync_tensor_device(tensor: torch.Tensor | None) -> None:
+    if tensor is not None and tensor.device.type == "cuda":
+        torch.cuda.synchronize(tensor.device)
+
+
+def _profile_elapsed(
+    profile: dict[str, Any] | None,
+    key: str,
+    tic: float,
+    device_tensor: torch.Tensor | None = None,
+    *,
+    append: bool = False,
+) -> float:
+    if profile is None:
+        return 0.0
+    _sync_tensor_device(device_tensor)
+    elapsed = time.perf_counter() - tic
+    if append:
+        profile.setdefault(key, []).append(elapsed)
+    else:
+        profile[key] = profile.get(key, 0.0) + elapsed
+    return elapsed
 
 
 class Gr00tN1d6ActionHead(nn.Module):
@@ -292,6 +317,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         state_features: torch.Tensor,
         embodiment_id: torch.Tensor,
         backbone_output: BatchFeature,
+        profile: dict[str, Any] | None = None,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -302,9 +328,11 @@ class Gr00tN1d6ActionHead(nn.Module):
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model
         """
+        total_tic = time.perf_counter()
         vl_embeds = backbone_features
 
         # Set initial actions as the sampled noise.
+        tic = time.perf_counter()
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
         actions = torch.randn(
@@ -314,9 +342,13 @@ class Gr00tN1d6ActionHead(nn.Module):
         )
 
         dt = 1.0 / self.num_inference_timesteps
+        _profile_elapsed(profile, "policy_action_head_init_sec", tic, actions)
 
         # Run denoising steps.
+        denoise_tic = time.perf_counter()
         for t in range(self.num_inference_timesteps):
+            step_tic = time.perf_counter()
+            tic = time.perf_counter()
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
             t_discretized = int(t_cont * self.num_timestep_buckets)
 
@@ -324,17 +356,29 @@ class Gr00tN1d6ActionHead(nn.Module):
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
+            _profile_elapsed(profile, "policy_action_head_timestep_sec", tic, timesteps_tensor)
+
+            tic = time.perf_counter()
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+            _profile_elapsed(
+                profile, "policy_action_head_action_encoder_sec", tic, action_features
+            )
+
             # Add position embedding.
             if self.config.add_pos_embed:
+                tic = time.perf_counter()
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
+                _profile_elapsed(profile, "policy_action_head_pos_embed_sec", tic, action_features)
 
             # Join vision, language, state and action embedding along sequence dimension.
+            tic = time.perf_counter()
             sa_embs = torch.cat((state_features, action_features), dim=1)
+            _profile_elapsed(profile, "policy_action_head_cat_sec", tic, sa_embs)
 
             # Run model forward.
+            tic = time.perf_counter()
             if self.config.use_alternate_vl_dit:
                 model_output = self.model(
                     hidden_states=sa_embs,
@@ -349,12 +393,31 @@ class Gr00tN1d6ActionHead(nn.Module):
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
                 )
+            _profile_elapsed(profile, "policy_action_head_diffusion_model_sec", tic, model_output)
+
+            tic = time.perf_counter()
             pred = self.action_decoder(model_output, embodiment_id)
 
             pred_velocity = pred[:, -self.action_horizon :]
+            _profile_elapsed(profile, "policy_action_head_action_decoder_sec", tic, pred)
 
             # Update actions using euler integration.
+            tic = time.perf_counter()
             actions = actions + dt * pred_velocity
+            _profile_elapsed(profile, "policy_action_head_integration_sec", tic, actions)
+            _profile_elapsed(
+                profile,
+                "policy_action_head_denoise_step_sec",
+                step_tic,
+                actions,
+                append=True,
+            )
+
+        _profile_elapsed(profile, "policy_action_head_denoise_sec", denoise_tic, actions)
+        if profile is not None:
+            profile["policy_action_head_denoise_steps"] = self.num_inference_timesteps
+            _profile_elapsed(profile, "policy_action_head_total_sec", total_tic, actions)
+
         return BatchFeature(
             data={
                 "action_pred": actions,
@@ -387,6 +450,35 @@ class Gr00tN1d6ActionHead(nn.Module):
             embodiment_id=action_input.embodiment_id,
             backbone_output=backbone_output,
         )
+
+    @torch.no_grad()
+    def get_action_profiled(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[BatchFeature, dict[str, Any]]:
+        """Generate actions and return a timing breakdown for inference analysis."""
+        del options
+        profile: dict[str, Any] = {}
+
+        tic = time.perf_counter()
+        features = self._encode_features(backbone_output, action_input)
+        _profile_elapsed(
+            profile,
+            "policy_action_head_encode_features_sec",
+            tic,
+            features.backbone_features,
+        )
+
+        action_outputs = self.get_action_with_features(
+            backbone_features=features.backbone_features,
+            state_features=features.state_features,
+            embodiment_id=action_input.embodiment_id,
+            backbone_output=backbone_output,
+            profile=profile,
+        )
+        return action_outputs, profile
 
     @property
     def device(self):
