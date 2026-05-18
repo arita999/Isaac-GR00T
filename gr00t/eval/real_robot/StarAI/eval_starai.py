@@ -63,9 +63,9 @@ TRAINING_INITIAL_POSE: Dict[str, float] = {
 MOTOR_NAMES = ["Motor_0", "Motor_1", "Motor_2", "Motor_3", "Motor_4", "Motor_5", "gripper"]
 
 DEFAULT_TRAINING_DATASET_CANDIDATES = [
-    # run_20260428_1839 was trained from the 300-episode original_data copy.
-    # Keep this first so diagnostics/source guides compare against the same
-    # distribution as the currently documented checkpoint.
+    # Current default checkpoint is trained from the n710 StarAI dataset.
+    "/media/tmc/DATA/data/original_data/20260427_data_n710",
+    # Older checkpoints used the 300-episode original_data copy.
     "/media/tmc/DATA/data/original_data/20260427_data",
     "/media/tmc/DATA/data/GR00T/20260427_data",
     "/media/tmc/data/data/original_data/20260427_data",
@@ -172,6 +172,17 @@ def resolve_training_dataset_path(dataset_path: str | None) -> str | None:
 def normalize_training_action_guide(mode: str) -> str:
     if mode in {"on", "true", "yes", "1"}:
         return "source_envelope"
+    return mode
+
+
+def action_source_label(training_action_guide: str) -> str:
+    mode = normalize_training_action_guide(training_action_guide)
+    if mode == "off":
+        return "learned_policy"
+    if mode == "source_replay":
+        return "training_dataset_replay"
+    if mode == "source_envelope":
+        return "learned_policy_clipped_to_training_dataset"
     return mode
 
 
@@ -946,6 +957,12 @@ def eval(cfg: EvalConfig):
     )
     if training_action_guide is not None:
         logging.info("Using training action guide: %s", training_action_guide.summary())
+    if cfg.training_action_guide != "off":
+        logging.warning(
+            "training_action_guide=%s modifies learned policy actions. "
+            "Use training_action_guide=off to follow the learned GR00T policy trajectory.",
+            cfg.training_action_guide,
+        )
 
     # -------------------------------------------------------------------------
     # 1. Initialize Robot Hardware
@@ -1005,6 +1022,7 @@ def eval(cfg: EvalConfig):
         "language_key": runtime_language_key,
         "requested_language_key": cfg.language_key,
         "camera_keys": cfg.camera_keys,
+        "action_source": action_source_label(cfg.training_action_guide),
         "action_horizon": cfg.action_horizon,
         "execute_steps": cfg.execute_steps,
         "action_select_index": cfg.action_select_index,
