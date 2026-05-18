@@ -712,6 +712,8 @@ def validate_control_config(cfg: "EvalConfig") -> None:
         raise ValueError("keep_gripper_open_until_sec must be >= 0.")
     if cfg.motion_post_send_wait_fraction < 0 or cfg.motion_post_send_wait_fraction > 1:
         raise ValueError("motion_post_send_wait_fraction must be between 0 and 1.")
+    if cfg.action_step_interval_ms < 0:
+        raise ValueError("action_step_interval_ms must be >= 0. Use 0 to disable pacing.")
     if 0 < cfg.motion_time_ms < MIN_ARM_MOTION_TIME_MS:
         raise ValueError(
             f"motion_time_ms must be 0 or >= {MIN_ARM_MOTION_TIME_MS}. "
@@ -929,6 +931,7 @@ class EvalConfig:
     temporal_ensemble_window: int = 8
     motion_time_ms: int = 250
     motion_post_send_wait_fraction: float = 0.0
+    action_step_interval_ms: int = 0
     keep_gripper_open_until_motor1: float = 20.0
     gripper_open_value: float = 80.0
     keep_gripper_open_until_sec: float = 0.0
@@ -1044,6 +1047,12 @@ def eval(cfg: EvalConfig):
         "policy_profile_logging": True,
         "motion_time_ms": cfg.motion_time_ms,
         "motion_post_send_wait_fraction": cfg.motion_post_send_wait_fraction,
+        "action_step_interval_ms": cfg.action_step_interval_ms,
+        "action_step_interval_target_hz": (
+            float(1000.0 / cfg.action_step_interval_ms)
+            if cfg.action_step_interval_ms > 0
+            else None
+        ),
         "keep_gripper_open_until_motor1": cfg.keep_gripper_open_until_motor1,
         "gripper_open_value": cfg.gripper_open_value,
         "keep_gripper_open_until_sec": cfg.keep_gripper_open_until_sec,
@@ -1102,6 +1111,8 @@ def eval(cfg: EvalConfig):
     timeout_deadline = start_time + cfg.timeout if cfg.timeout > 0 else None
     stop_reason = None
     state_elapsed_samples: List[float] = []
+    action_send_elapsed_samples: List[float] = []
+    last_action_send_started_at: float | None = None
     action_tick = 0
     temporal_ensemble_chunks: List[Dict[str, Any]] = []
 
@@ -1249,6 +1260,27 @@ def eval(cfg: EvalConfig):
                     )
                     break
 
+                action_step_interval_wait_sec = 0.0
+                if cfg.action_step_interval_ms > 0 and last_action_send_started_at is not None:
+                    next_send_at = last_action_send_started_at + (
+                        float(cfg.action_step_interval_ms) / 1000.0
+                    )
+                    remaining_sec = next_send_at - time.monotonic()
+                    if remaining_sec > 0:
+                        time.sleep(remaining_sec)
+                        action_step_interval_wait_sec = remaining_sec
+
+                    now = time.monotonic()
+                    if timeout_deadline is not None and now >= timeout_deadline:
+                        stop_reason = "timeout"
+                        logging.info(
+                            "Timeout reached after %.3fs (limit %ss) before paced action[%d]. Saving logs...",
+                            now - start_time,
+                            cfg.timeout,
+                            i,
+                        )
+                        break
+
                 tic = time.monotonic()
                 target_tick = action_tick
                 if cfg.temporal_ensemble:
@@ -1339,6 +1371,9 @@ def eval(cfg: EvalConfig):
                 )
 
                 send_started_at = time.monotonic()
+                last_action_send_started_at = send_started_at
+                action_send_elapsed_sec = send_started_at - start_time
+                action_send_elapsed_samples.append(action_send_elapsed_sec)
                 performed_action = send_robot_action(robot, sent_action, cfg.motion_time_ms)
                 write_joint_log_row(
                     joint_log_file,
@@ -1380,6 +1415,8 @@ def eval(cfg: EvalConfig):
                         "guided_action": safe_raw_action,
                         "sent_action": sent_action,
                         "performed_action": performed_action,
+                        "action_send_elapsed_sec": action_send_elapsed_sec,
+                        "action_step_interval_wait_sec": action_step_interval_wait_sec,
                         "motion_wait_sec": motion_wait_sec,
                         "post_action_state": post_action_state,
                         "post_action_state_elapsed_sec": post_action_elapsed_sec,
@@ -1447,6 +1484,18 @@ def eval(cfg: EvalConfig):
                     "actual_state_loop_dt_median_sec": float(np.median(intervals)),
                     "num_state_samples": int(len(state_elapsed_samples)),
                     "end_elapsed_sec": float(state_elapsed_samples[-1]),
+                }
+            )
+        if len(action_send_elapsed_samples) > 1:
+            intervals = np.diff(np.asarray(action_send_elapsed_samples, dtype=np.float64))
+            session_meta.update(
+                {
+                    "actual_action_send_hz_mean": float(1.0 / np.mean(intervals)),
+                    "actual_action_send_hz_median": float(1.0 / np.median(intervals)),
+                    "actual_action_send_dt_mean_sec": float(np.mean(intervals)),
+                    "actual_action_send_dt_median_sec": float(np.median(intervals)),
+                    "num_action_sends": int(len(action_send_elapsed_samples)),
+                    "last_action_send_elapsed_sec": float(action_send_elapsed_samples[-1]),
                 }
             )
         session_meta["stop_reason"] = stop_reason or "unknown"
