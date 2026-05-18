@@ -685,6 +685,8 @@ def validate_control_config(cfg: "EvalConfig") -> None:
         raise ValueError(
             "training_action_guide must be 'off', 'on', 'source_envelope', or 'source_replay'."
         )
+    if cfg.timeout < 0:
+        raise ValueError("timeout must be >= 0. Use timeout=0 to disable the runtime limit.")
     if cfg.training_action_guide_until_sec < 0:
         raise ValueError("training_action_guide_until_sec must be >= 0.")
     if cfg.training_action_guide_setup_sec < 0:
@@ -997,6 +999,8 @@ def eval(cfg: EvalConfig):
         "runtime": "eval_starai",
         "policy_host": cfg.policy_host,
         "policy_port": cfg.policy_port,
+        "timeout_sec": cfg.timeout,
+        "timeout_enabled": cfg.timeout > 0,
         "lang_instruction": cfg.lang_instruction,
         "language_key": runtime_language_key,
         "requested_language_key": cfg.language_key,
@@ -1071,17 +1075,33 @@ def eval(cfg: EvalConfig):
 
     step = 0
     start_time = time.monotonic()
+    timeout_deadline = start_time + cfg.timeout if cfg.timeout > 0 else None
+    stop_reason = None
     state_elapsed_samples: List[float] = []
     action_tick = 0
     temporal_ensemble_chunks: List[Dict[str, Any]] = []
 
     logging.info(f"Logging to: {log_dir}")
+    if timeout_deadline is not None:
+        logging.info("Runtime timeout: %s seconds", cfg.timeout)
+    else:
+        logging.info("Runtime timeout disabled.")
 
     # -------------------------------------------------------------------------
     # 4. Main real-time control loop
     # -------------------------------------------------------------------------
     try:
         while True:
+            now = time.monotonic()
+            if timeout_deadline is not None and now >= timeout_deadline:
+                stop_reason = "timeout"
+                logging.info(
+                    "Timeout reached after %.3fs (limit %ss). Saving logs...",
+                    now - start_time,
+                    cfg.timeout,
+                )
+                break
+
             obs = robot.get_observation()
             obs["lang"] = cfg.lang_instruction
 
@@ -1194,6 +1214,17 @@ def eval(cfg: EvalConfig):
                 actions_to_execute = list(enumerate(raw_actions[:steps_to_execute]))
 
             for i, raw_action in actions_to_execute:
+                now = time.monotonic()
+                if timeout_deadline is not None and now >= timeout_deadline:
+                    stop_reason = "timeout"
+                    logging.info(
+                        "Timeout reached after %.3fs (limit %ss) before action[%d]. Saving logs...",
+                        now - start_time,
+                        cfg.timeout,
+                        i,
+                    )
+                    break
+
                 tic = time.monotonic()
                 target_tick = action_tick
                 if cfg.temporal_ensemble:
@@ -1343,9 +1374,15 @@ def eval(cfg: EvalConfig):
 
             write_policy_log_record(policy_log_file, policy_log_record)
             step += 1
+            if stop_reason is not None:
+                break
 
     except KeyboardInterrupt:
+        stop_reason = "keyboard_interrupt"
         logging.info("Interrupted. Saving logs...")
+    except Exception:
+        stop_reason = "exception"
+        raise
     finally:
         joint_log_file.close()
         video_frame_log_file.close()
@@ -1388,6 +1425,8 @@ def eval(cfg: EvalConfig):
                     "end_elapsed_sec": float(state_elapsed_samples[-1]),
                 }
             )
+        session_meta["stop_reason"] = stop_reason or "unknown"
+        session_meta["wall_elapsed_sec"] = float(time.monotonic() - start_time)
         if video_rewrite_results:
             session_meta["video_rewrite_results"] = video_rewrite_results
         with open(session_meta_path, "w", encoding="utf-8") as session_meta_file:
