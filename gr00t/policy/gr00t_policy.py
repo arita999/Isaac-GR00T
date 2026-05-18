@@ -6,6 +6,8 @@ This module provides the core policy classes for running Gr00t models:
 """
 
 from pathlib import Path
+import inspect
+import os
 import time
 from typing import Any
 
@@ -78,6 +80,93 @@ def resolve_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
     return aliases[normalized]
 
 
+def _parse_tensorrt_targets(targets: str) -> set[str]:
+    normalized_targets = {
+        item.strip().lower().replace("-", "_")
+        for item in targets.split(",")
+        if item.strip()
+    }
+    if not normalized_targets or normalized_targets == {"none"}:
+        return set()
+    if "all" in normalized_targets:
+        normalized_targets.remove("all")
+        normalized_targets.update({"action_head", "backbone"})
+
+    aliases = {
+        "action": "action_head",
+        "action_head_model": "action_head",
+        "dit": "action_head",
+        "diffusion": "action_head",
+        "vlm": "backbone",
+    }
+    parsed = {aliases.get(target, target) for target in normalized_targets}
+    supported = {"action_head", "backbone"}
+    unknown = parsed - supported
+    if unknown:
+        raise ValueError(
+            f"Unsupported tensorrt_target={sorted(unknown)}. "
+            "Use one of: none, action_head, backbone, all."
+        )
+    return parsed
+
+
+def _filter_tensorrt_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Keep Torch-TensorRT compile options compatible across installed versions."""
+    try:
+        import torch_tensorrt
+
+        settings_cls = torch_tensorrt.dynamo.CompilationSettings
+        supported = set(inspect.signature(settings_cls).parameters)
+    except Exception:
+        return options
+
+    filtered = dict(options)
+    if "truncate_long_and_double" in filtered and "truncate_long_and_double" not in supported:
+        value = filtered.pop("truncate_long_and_double")
+        if "truncate_double" in supported:
+            filtered["truncate_double"] = value
+    return {key: value for key, value in filtered.items() if key in supported}
+
+
+def _compile_module_with_tensorrt(
+    module: torch.nn.Module,
+    *,
+    name: str,
+    compute_dtype: torch.dtype,
+    cache_dir: str,
+    min_block_size: int,
+    require_full_compilation: bool,
+) -> torch.nn.Module:
+    import torch_tensorrt  # noqa: F401  # Registers the torch_tensorrt compile backend.
+
+    os.makedirs(cache_dir, exist_ok=True)
+    precision = torch.float16 if compute_dtype == torch.bfloat16 else compute_dtype
+    enabled_precisions = {precision}
+    if precision == torch.float16:
+        # Let Torch-TensorRT keep unsupported precision-sensitive fragments in fp32.
+        enabled_precisions.add(torch.float32)
+
+    options = _filter_tensorrt_options(
+        {
+            "enabled_precisions": enabled_precisions,
+            "truncate_long_and_double": True,
+            "min_block_size": min_block_size,
+            "require_full_compilation": require_full_compilation,
+            "cache_built_engines": True,
+            "reuse_cached_engines": True,
+            "timing_cache_path": os.path.join(cache_dir, f"{name}_timing_cache.bin"),
+            "runtime_cache_path": os.path.join(cache_dir, f"{name}_runtime_cache.bin"),
+        }
+    )
+    return torch.compile(
+        module,
+        backend="torch_tensorrt",
+        dynamic=False,
+        fullgraph=require_full_compilation,
+        options=options,
+    )
+
+
 class Gr00tPolicy(BasePolicy):
     """Core policy class for Gr00t model inference.
 
@@ -100,6 +189,11 @@ class Gr00tPolicy(BasePolicy):
         strict: bool = True,
         compute_dtype: str | torch.dtype = "bfloat16",
         profile_model_detail: bool = True,
+        tensorrt_target: str = "none",
+        tensorrt_cache_dir: str = "/tmp/gr00t_tensorrt_cache",
+        tensorrt_min_block_size: int = 5,
+        tensorrt_require_full_compilation: bool = False,
+        tensorrt_strict: bool = True,
     ):
         """Initialize the Gr00t Policy.
 
@@ -110,6 +204,11 @@ class Gr00tPolicy(BasePolicy):
             strict: Whether to enforce strict input validation (default: True)
             compute_dtype: Floating point dtype used for model weights and floating inputs.
             profile_model_detail: Whether to split model inference profile into sub-stages.
+            tensorrt_target: Comma-separated TensorRT targets: none, action_head, backbone, all.
+            tensorrt_cache_dir: Directory for Torch-TensorRT timing/runtime caches.
+            tensorrt_min_block_size: Minimum block size for TensorRT graph partitioning.
+            tensorrt_require_full_compilation: Require full TensorRT compilation for target graphs.
+            tensorrt_strict: Raise if TensorRT setup fails; otherwise continue with PyTorch modules.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -118,12 +217,25 @@ class Gr00tPolicy(BasePolicy):
         model_dir = Path(model_path)
         self.compute_dtype = resolve_torch_dtype(compute_dtype)
         self.profile_model_detail = profile_model_detail
+        self.tensorrt_targets = _parse_tensorrt_targets(tensorrt_target)
+        self.tensorrt_status: dict[str, Any] = {
+            "enabled": bool(self.tensorrt_targets),
+            "requested_targets": sorted(self.tensorrt_targets),
+            "compiled_targets": [],
+            "failed_targets": {},
+        }
 
         # Load the pretrained model and move to the requested inference precision.
         model = AutoModel.from_pretrained(model_dir, low_cpu_mem_usage=True)
         model.eval()  # Set model to evaluation mode
         model.to(device=device, dtype=self.compute_dtype)
         self.model = model
+        self._configure_tensorrt(
+            cache_dir=tensorrt_cache_dir,
+            min_block_size=tensorrt_min_block_size,
+            require_full_compilation=tensorrt_require_full_compilation,
+            strict=tensorrt_strict,
+        )
 
         # Load the processor for input/output transformation
         self.processor: BaseProcessor = AutoProcessor.from_pretrained(model_dir)
@@ -141,6 +253,91 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) == 1, "Only one language key is supported"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+
+    def _configure_tensorrt(
+        self,
+        *,
+        cache_dir: str,
+        min_block_size: int,
+        require_full_compilation: bool,
+        strict: bool,
+    ) -> None:
+        if not self.tensorrt_targets:
+            return
+
+        model_device = _module_device(self.model)
+        if model_device is None or model_device.type != "cuda":
+            message = "TensorRT acceleration requires a CUDA model device."
+            if strict:
+                raise RuntimeError(message)
+            self.tensorrt_status["failed_targets"]["all"] = message
+            print(f"[TensorRT] {message} Continuing without TensorRT.")
+            return
+
+        if self.compute_dtype == torch.bfloat16:
+            message = (
+                "TensorRT acceleration is configured for float16/float32 inference here. "
+                "Rerun with --compute-dtype float16 when using --tensorrt-target."
+            )
+            if strict:
+                raise RuntimeError(message)
+            self.tensorrt_status["failed_targets"]["all"] = message
+            print(f"[TensorRT] {message} Continuing without TensorRT.")
+            return
+
+        try:
+            import torch_tensorrt  # noqa: F401
+        except ImportError as exc:
+            message = (
+                "torch_tensorrt is not installed. Install it in the GR00T venv, e.g. "
+                "python -m pip install torch-tensorrt "
+                "--extra-index-url https://download.pytorch.org/whl/cu128"
+            )
+            if strict:
+                raise RuntimeError(message) from exc
+            self.tensorrt_status["failed_targets"]["all"] = message
+            print(f"[TensorRT] {message} Continuing without TensorRT.")
+            return
+
+        if "action_head" in self.tensorrt_targets:
+            try:
+                self.model.action_head.model = _compile_module_with_tensorrt(
+                    self.model.action_head.model,
+                    name="action_head",
+                    compute_dtype=self.compute_dtype,
+                    cache_dir=cache_dir,
+                    min_block_size=min_block_size,
+                    require_full_compilation=require_full_compilation,
+                )
+                self.tensorrt_status["compiled_targets"].append("action_head")
+                print("[TensorRT] Compiled action_head diffusion model via torch_tensorrt.")
+            except Exception as exc:
+                message = str(exc)
+                if strict:
+                    raise RuntimeError(
+                        f"Failed to compile action_head with TensorRT: {message}"
+                    ) from exc
+                self.tensorrt_status["failed_targets"]["action_head"] = message
+                print(f"[TensorRT] Failed to compile action_head: {message}")
+
+        if "backbone" in self.tensorrt_targets:
+            try:
+                self.model.backbone = _compile_module_with_tensorrt(
+                    self.model.backbone,
+                    name="backbone",
+                    compute_dtype=self.compute_dtype,
+                    cache_dir=cache_dir,
+                    min_block_size=min_block_size,
+                    require_full_compilation=require_full_compilation,
+                )
+                self.tensorrt_status["compiled_targets"].append("backbone")
+                print("[TensorRT] Compiled backbone via torch_tensorrt.")
+            except Exception as exc:
+                message = str(exc)
+                if strict:
+                    raise RuntimeError(f"Failed to compile backbone with TensorRT: {message}") from exc
+                self.tensorrt_status["failed_targets"]["backbone"] = message
+                print(f"[TensorRT] Failed to compile backbone: {message}")
 
     def _get_model_action_with_profile(
         self, collated_inputs: dict[str, Any], options: dict[str, Any] | None
@@ -458,6 +655,17 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=self.compute_dtype)
         profile["policy_dtype_cast_sec"] = time.perf_counter() - tic
         profile["policy_compute_dtype"] = str(self.compute_dtype).removeprefix("torch.")
+        profile["policy_tensorrt_enabled"] = bool(self.tensorrt_targets)
+        profile["policy_tensorrt_active"] = bool(
+            self.tensorrt_status.get("compiled_targets", [])
+        )
+        profile["policy_tensorrt_requested_targets"] = sorted(self.tensorrt_targets)
+        profile["policy_tensorrt_compiled_targets"] = list(
+            self.tensorrt_status.get("compiled_targets", [])
+        )
+        profile["policy_tensorrt_failed_targets"] = dict(
+            self.tensorrt_status.get("failed_targets", {})
+        )
 
         # Step 4: Run model inference to predict actions
         model_pred, model_profile = self._get_model_action_with_profile(collated_inputs, options)

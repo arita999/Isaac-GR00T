@@ -32,6 +32,21 @@ class ServerConfig:
     profile_model_detail: bool = True
     """Log detailed model inference breakdown. Disable with --no-profile-model-detail."""
 
+    tensorrt_target: str = "none"
+    """Comma-separated TensorRT compile targets: none, action_head, backbone, or all."""
+
+    tensorrt_cache_dir: str = "/tmp/gr00t_tensorrt_cache"
+    """Directory used for Torch-TensorRT timing/runtime caches."""
+
+    tensorrt_min_block_size: int = 5
+    """Minimum Torch-TensorRT partition size. Larger values reduce tiny TensorRT engines."""
+
+    tensorrt_require_full_compilation: bool = False
+    """Require selected target graphs to compile fully with TensorRT."""
+
+    tensorrt_strict: bool = True
+    """Raise if TensorRT setup fails. Disable to fall back to PyTorch modules."""
+
     # Replay policy configs
     dataset_path: str | None = None
     """Path to the dataset for replay trajectory"""
@@ -63,6 +78,8 @@ def main(config: ServerConfig):
     print(f"  Device: {config.device}")
     print(f"  Compute dtype: {config.compute_dtype}")
     print(f"  Profile model detail: {config.profile_model_detail}")
+    print(f"  TensorRT target: {config.tensorrt_target}")
+    print(f"  TensorRT cache dir: {config.tensorrt_cache_dir}")
     print(f"  Host: {config.host}")
     print(f"  Port: {config.port}")
 
@@ -79,6 +96,11 @@ def main(config: ServerConfig):
             strict=config.strict,
             compute_dtype=config.compute_dtype,
             profile_model_detail=config.profile_model_detail,
+            tensorrt_target=config.tensorrt_target,
+            tensorrt_cache_dir=config.tensorrt_cache_dir,
+            tensorrt_min_block_size=config.tensorrt_min_block_size,
+            tensorrt_require_full_compilation=config.tensorrt_require_full_compilation,
+            tensorrt_strict=config.tensorrt_strict,
         )
     elif config.dataset_path is not None:
         if config.modality_config_path is None:
