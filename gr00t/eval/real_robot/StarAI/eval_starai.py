@@ -169,13 +169,19 @@ def resolve_training_dataset_path(dataset_path: str | None) -> str | None:
     return None
 
 
-def normalize_training_action_guide(mode: str) -> str:
-    if mode in {"on", "true", "yes", "1"}:
+def normalize_training_action_guide(mode: Any) -> str:
+    if isinstance(mode, bool):
+        return "source_envelope" if mode else "off"
+
+    normalized = str(mode).strip().lower()
+    if normalized in {"on", "true", "yes", "1"}:
         return "source_envelope"
-    return mode
+    if normalized in {"off", "false", "no", "0", "none", "null"}:
+        return "off"
+    return normalized
 
 
-def action_source_label(training_action_guide: str) -> str:
+def action_source_label(training_action_guide: Any) -> str:
     mode = normalize_training_action_guide(training_action_guide)
     if mode == "off":
         return "learned_policy"
