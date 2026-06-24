@@ -1,0 +1,62 @@
+[githubへのpush]
+==================================
+arita999
+<GitHub tokenはここに保存しない>
+
+
+[webカメラのポート番号調査]
+==================================
+lerobot-find-cameras opencv
+
+
+[lerobotデータセットからGR00Tデータセットへの形式変換]
+==================================
+生成AIにやってもらう（30Hz変換すること）
+
+
+[GR00T Fine-tuningのやり方]
+=============================================
+cd ~/Isaac-GR00T
+source .venv/bin/activate
+python gr00t/experiment/launch_finetune.py \
+  --base-model-path nvidia/GR00T-N1.6-3B \
+  --dataset-path ~/.cache/huggingface/lerobot/hasubo/20260408_star_3cameras_groot_v2 \
+  --embodiment-tag NEW_EMBODIMENT \
+  --modality-config-path examples/StarAI/starai_single_arm_config.py \
+  --num-gpus 1 \
+  --output-dir ./output/dir \
+  --max-steps 5000
+
+
+[推論のやり方]
+=============================================
+①ターミナル１
+cd ~/Isaac-GR00T
+source .venv/bin/activate
+NO_ALBUMENTATIONS_UPDATE=1 HF_HUB_OFFLINE=1 \
+  ~/Isaac-GR00T/.venv/bin/python gr00t/eval/run_gr00t_server.py \
+  --embodiment-tag NEW_EMBODIMENT \
+  --model-path /media/tmc/DATA/data/GR00T/N1.7/n710/checkpoint-50000 \
+  --device cuda:0 \
+  --host 0.0.0.0 \
+  --port 5555
+
+
+②ターミナル２
+source /home/tmc/lerobot/.venv/bin/activate
+cd ~/Isaac-GR00T
+PYTHONPATH=/home/tmc/Isaac-GR00T \
+/home/tmc/lerobot/.venv/bin/python -m gr00t.eval.real_robot.StarAI.eval_starai \
+  --robot.type lerobot_robot_cello \
+  --robot.port /dev/ttyUSB1 \
+  --robot.cameras '{side: {type: opencv, index_or_path: 10, width: 640, height: 480, fps: 30},
+rear: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30},
+onhand: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}}' \
+  --policy_host localhost \
+  --policy_port 5555 \
+  --execute_steps 2 \
+  --temporal_ensemble true \
+  --temporal_ensemble_decay 0.8 \
+  --temporal_ensemble_window 4 \
+  --robot.id my_awesome_staraicello_arm4
+
