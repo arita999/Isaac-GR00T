@@ -19,7 +19,7 @@ lerobot-find-cameras opencv
 cd ~/Isaac-GR00T
 source .venv/bin/activate
 python gr00t/experiment/launch_finetune.py \
-  --base-model-path nvidia/GR00T-N1.6-3B \
+  --base-model-path nvidia/GR00T-N1.7-3B \
   --dataset-path ~/.cache/huggingface/lerobot/hasubo/20260408_star_3cameras_groot_v2 \
   --embodiment-tag NEW_EMBODIMENT \
   --modality-config-path examples/StarAI/starai_single_arm_config.py \
@@ -41,6 +41,16 @@ NO_ALBUMENTATIONS_UPDATE=1 HF_HUB_OFFLINE=1 \
   --host 0.0.0.0 \
   --port 5555
 
+# [高速化フラグは撤去済み] TensorRT + --compute-dtype float16 は使用禁止。
+#   理由(2026-07-02 20260702_075728のログで確認):
+#     - float16のTensorRT(action_head)化で拡散ヘッド出力が全チャンネルNaNになった。
+#     - clamp_action_step=False だったためNaNがそのままモータへ送られ、ロボットが暴走。
+#     - さらに初回コンパイルが推論内で56秒走り、その間ロボットが停止した(=「長時間停止」の正体)。
+#   GR00Tの拡散ヘッドはbfloat16前提で、float16(狭いダイナミックレンジ)と相性が悪くNaN化する。
+#   → 高速化は既定の bfloat16 / PyTorch(TensorRTなし) が安全な基準構成。
+#   再挑戦するなら先にNaN検出ガード(送信前にNaNなら停止)を eval 側へ入れてから。
+#   参考: 素の構成の実測は推論約128ms / actual_action_send_hz_mean 約14.6Hz。
+
 
 ②ターミナル２
 source /home/tmc/lerobot/.venv/bin/activate
@@ -54,9 +64,9 @@ rear: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30},
 onhand: {type: opencv, index_or_path: 8, width: 640, height: 480, fps: 30}}' \
   --policy_host localhost \
   --policy_port 5555 \
-  --execute_steps 2 \
+  --execute_steps 4 \
   --temporal_ensemble true \
   --temporal_ensemble_decay 0.8 \
-  --temporal_ensemble_window 4 \
+  --temporal_ensemble_window 6 \
   --robot.id my_awesome_staraicello_arm4
 

@@ -454,6 +454,16 @@ def action_was_clamped(raw_action: Dict[str, float], sent_action: Dict[str, floa
     )
 
 
+def nonfinite_action_keys(action: Dict[str, float]) -> List[str]:
+    """Return the keys whose command value is NaN or +/-Inf.
+
+    A non-finite goal position must never reach the servos: many buses treat
+    NaN/Inf as an out-of-range command and drive the joint to a limit at full
+    speed (observed as a runaway). Callers should refuse to send such actions.
+    """
+    return [key for key, val in action.items() if not np.isfinite(float(val))]
+
+
 def temporal_ensemble_action(
     action_chunks: List[Dict[str, Any]],
     target_tick: int,
@@ -1359,6 +1369,34 @@ def eval(cfg: EvalConfig):
                 was_clamped = action_was_clamped(raw_action, sent_action)
                 if step_clamped:
                     logging.warning("Clamped action[%d] before sending to robot.", i)
+
+                # --- Safety: never send a non-finite command to the servos ---
+                bad_keys = nonfinite_action_keys(sent_action)
+                if bad_keys:
+                    stop_reason = "nonfinite_action"
+                    logging.error(
+                        "Non-finite action for %s at step %d action[%d]; refusing to send "
+                        "and stopping. sent_action=%s",
+                        bad_keys,
+                        step,
+                        i,
+                        sent_action,
+                    )
+                    policy_log_record["executed_actions"].append(
+                        {
+                            "chunk_index": i,
+                            "target_tick": target_tick,
+                            "raw_action": raw_action,
+                            "temporal_ensemble_action": policy_action,
+                            "temporal_ensemble_info": temporal_info,
+                            "pre_action_state": pre_action_state,
+                            "sent_action": sent_action,
+                            "nonfinite_keys": bad_keys,
+                            "aborted": True,
+                            "elapsed_sec": time.monotonic() - start_time,
+                        }
+                    )
+                    break
 
                 # --- Log command sent to the robot ---
                 write_joint_log_row(
